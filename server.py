@@ -1,122 +1,135 @@
-import os, re, time, httpx
-from fastapi import FastAPI, HTTPException, Request
+# server.py
+import os, re, time
+from pathlib import Path
+import httpx
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from dotenv import load_dotenv
 
-load_dotenv()
-BASE_URL = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1")
-API_KEY  = os.getenv("OLLAMA_API_KEY")
+# --- Konfiguration aus Umgebungsvariablen ---
+OLLAMA_API_KEY  = os.getenv("OLLAMA_API_KEY", "").strip()
+OLLAMA_CLOUD_BASE = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
 
-app = FastAPI(title="Ollama Cloud Proxy")
+# --- FastAPI ---
+app = FastAPI(title="Website-Generator KI")
+
+# CORS: gleiche Origin reicht. Für Debug: ["*"] möglich, aber hier nicht nötig.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # bei Netlify/Prod: auf deine Domains einschränken
+    allow_origins=[],      # gleiche Origin liefert HTML + API → kein CORS nötig
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST","GET","OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
-# ---- Static + HTML ----
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-INDEX_FILE = os.path.join(BASE_DIR, "index.html")
-app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
-
-@app.get("/favicon.ico")
-def favicon():
-    ico = os.path.join(BASE_DIR, "favicon.ico")
-    if os.path.exists(ico):
-        return FileResponse(ico)
-    # kleines Emoji-Favicon inline
-    return JSONResponse(status_code=204, content=None)
+# --- Statische Auslieferung / Root ---
+BASE_DIR = Path(__file__).resolve().parent
+INDEX_FILE = BASE_DIR / "index.html"
+app.mount("/static", StaticFiles(directory=str(BASE_DIR)), name="static")
 
 @app.get("/")
-def root(request: Request):
-    # Wenn Browser HTML will und index.html existiert → liefern
-    wants_html = "text/html" in (request.headers.get("accept") or "").lower()
-    if wants_html and os.path.exists(INDEX_FILE):
-        return FileResponse(INDEX_FILE)
-    # sonst JSON wie bisher
-    return {"ok": True, "msg": "Ollama Cloud Proxy läuft", "endpoints": ["/health", "/generate"]}
+def root():
+    if INDEX_FILE.exists():
+        return FileResponse(str(INDEX_FILE))
+    return JSONResponse({"error":"index.html fehlt"}, status_code=404)
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "api_key_set": bool(OLLAMA_API_KEY), "base": OLLAMA_CLOUD_BASE}
 
+# --- Datamodel ---
 class Req(BaseModel):
     prompt: str
-    model: str | None = None
+    model: str | None = "qwen3-coder:480b-cloud"
+    max_tokens: int | None = 1000
+    temperature: float | None = 0.4
 
-def _strip_code_fences(t: str) -> str:
-    if not t: 
-        return t
-    t = re.sub(r"^\s*```[a-zA-Z0-9]*\s*", "", t.strip())
-    t = re.sub(r"\s*```\s*$", "", t)
-    return t.strip()
+# --- Helper ---
+def _strip_fences(txt: str) -> str:
+    if not txt: return txt
+    txt = re.sub(r"^\s*```[a-zA-Z0-9]*\s*", "", txt.strip())
+    txt = re.sub(r"\s*```\s*$", "", txt)
+    return txt.strip()
 
-async def call_cloud(payload: dict) -> dict:
-    if not API_KEY:
-        raise HTTPException(status_code=500, detail="OLLAMA_API_KEY fehlt.")
-    url = f"{BASE_URL}/chat/completions"
+async def _call_ollama(payload: dict) -> dict:
+    if not OLLAMA_API_KEY:
+        raise HTTPException(status_code=500, detail="OLLAMA_API_KEY fehlt")
+    url = f"{OLLAMA_CLOUD_BASE}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {OLLAMA_API_KEY}",
         "Content-Type": "application/json",
         "Connection": "keep-alive",
     }
     limits  = httpx.Limits(max_keepalive_connections=2, max_connections=4)
-    timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=30.0)
+    timeout = httpx.Timeout(connect=10.0, read=60.0, write=20.0, pool=20.0)
+    retriable = {408, 502, 503, 504}
 
-    retriable = {502, 503, 504, 408}
-    backoff = 1.0
     async with httpx.AsyncClient(http2=False, limits=limits, timeout=timeout) as client:
-        for attempt in range(4):
+        backoff = 1.0
+        for attempt in range(2):
             try:
                 r = await client.post(url, headers=headers, json=payload)
-                if r.status_code in retriable and attempt < 3:
+                if r.status_code in retriable and attempt == 0:
                     time.sleep(backoff); backoff *= 2; continue
                 if r.status_code >= 400:
-                    raise HTTPException(status_code=r.status_code, detail=r.text)
+                    raise HTTPException(status_code=502, detail=f"Provider {r.status_code}: {r.text[:400]}")
                 return r.json()
             except httpx.RequestError as e:
-                if attempt < 3:
-                    time.sleep(backoff); backoff *= 2; continue
-                raise HTTPException(status_code=502, detail=f"Netzwerkfehler: {e}") from e
+                if attempt == 0:
+                    time.sleep(1.5); continue
+                raise HTTPException(status_code=502, detail=f"Netzwerkfehler: {e}")
 
+# --- API ---
 @app.post("/generate")
 async def generate(req: Req):
-    if not req.prompt or not req.prompt.strip():
+    prompt = (req.prompt or "").strip()
+    if not prompt:
         raise HTTPException(status_code=400, detail="prompt fehlt")
-    model = (req.model or "qwen3-coder:480b-cloud").strip()
 
-    system = ("Du bist ein KI-Webdesigner. Antworte ausschließlich mit einem vollständigen HTML-Dokument. "
-              "Eingebettetes CSS. Keine externen Skripte.")
-    user = (f"Erstelle eine One-Page-Website basierend auf:\n\n{req.prompt}\n\n"
-            "- responsiv, gute Lesbarkeit\n- keine externen Abhängigkeiten\n- gib NUR das HTML-Dokument zurück")
+    model = (req.model or "qwen3-coder:480b-cloud").strip()
+    max_tokens = int(req.max_tokens or 1000)
+    temperature = float(req.temperature if req.temperature is not None else 0.4)
+
+    system = (
+        "Du bist ein KI-Webdesigner. Antworte ausschließlich mit einem vollständigen, "
+        "lauffähigen HTML-Dokument mit eingebettetem CSS. Keine externen Skripte/Fonts."
+    )
+    user = (
+        f"Erstelle eine moderne One-Page-Website basierend auf:\n\n{prompt}\n\n"
+        "- responsiv, gut lesbar\n- dezentes Design\n- keine externen Abhängigkeiten\n"
+        "- gib NUR das vollständige HTML-Dokument zurück"
+    )
 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role":"system","content": system},
+            {"role":"user","content":   user},
         ],
-        "temperature": 0.4,
-        "max_tokens": 1500,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
         "stream": False,
     }
 
-    data = await call_cloud(payload)
+    data = await _call_ollama(payload)
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    html = _strip_code_fences(content)
-    if not html or "<html" not in html.lower():
-        html = ("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
-                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>Website</title><style>body{font-family:Arial;padding:24px;max-width:900px;margin:0 auto}</style>"
-                f"</head><body><h1>Entwurf</h1><pre>{content}</pre></body></html>")
-    return {"html": html}
+    html = _strip_fences(content)
 
-# Start lokal:
-#   uvicorn server:app --host 127.0.0.1 --port 8000 --reload
-# Start Render:
-#   uvicorn server:app --host 0.0.0.0 --port $PORT
+    if "<html" not in html.lower():
+        html = (
+            "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Entwurf</title><style>body{font-family:Arial;padding:24px;max-width:900px;margin:0 auto}</style>"
+            f"</head><body><h1>Entwurf</h1><pre>{content}</pre></body></html>"
+        )
+
+    usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
+    return {"html": html, "meta": usage}
+
+# --- local/Render start ---
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))  # Render setzt $PORT automatisch
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
