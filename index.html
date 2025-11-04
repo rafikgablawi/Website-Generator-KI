@@ -5,73 +5,82 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Website-Generator KI</title>
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #f3f4f6;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: flex-start;
-      min-height: 100vh;
-      margin: 0;
-      padding: 30px;
-    }
-    h1 {
-      color: #333;
-      margin-bottom: 10px;
-    }
-    textarea {
-      width: 90%;
-      max-width: 600px;
-      height: 120px;
-      padding: 10px;
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      font-size: 16px;
-      margin-bottom: 10px;
-    }
-    button {
-      background: #0078ff;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 10px 20px;
-      cursor: pointer;
-      font-size: 16px;
-    }
-    button:hover { background: #005ec2; }
-    #preview {
-      margin-top: 20px;
-      width: 90%;
-      max-width: 800px;
-      background: white;
-      border-radius: 8px;
-      padding: 20px;
-      box-shadow: 0 0 10px rgba(0,0,0,0.1);
-      min-height: 200px;
-    }
+    body{font-family:Arial, sans-serif;background:#f3f4f6;display:flex;flex-direction:column;align-items:center;min-height:100vh;margin:0;padding:30px}
+    h1{color:#333;margin:0 0 10px}
+    textarea{width:90%;max-width:800px;height:140px;padding:10px;border:1px solid #ccc;border-radius:8px;font-size:16px;margin:8px 0}
+    .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    input,button{border-radius:8px;font-size:14px;padding:10px;border:1px solid #ccc}
+    button{background:#0078ff;color:#fff;border:none;cursor:pointer}
+    button:hover{background:#005ec2}
+    #preview{margin-top:20px;width:90%;max-width:1000px;background:#fff;border-radius:8px;padding:20px;box-shadow:0 0 10px rgba(0,0,0,.1);min-height:220px}
+    .status{font-size:13px;color:#555;margin-top:8px;min-height:18px}
+    .err{color:#b00020}
   </style>
 </head>
 <body>
   <h1>🧠 Website-Generator KI</h1>
   <p>Beschreibe deine Website:</p>
-  <textarea id="prompt" placeholder="z. B. Eine moderne Portfolio-Seite für einen Fotografen"></textarea>
-  <button onclick="generate()">Website erstellen</button>
-  <div id="preview">💡 Hier erscheint deine generierte Website ...</div>
+  <textarea id="prompt" placeholder="z. B. Moderne Homepage für „Studio Aurora“ mit Hero, Leistungen, Prozess, Referenzen, Kontakt."></textarea>
+
+  <div class="bar">
+    <input id="model" value="qwen3-coder:480b-cloud" title="Ollama-Cloud-Modell" />
+    <input id="max" type="number" value="1200" min="200" max="3500" title="max_tokens" />
+    <button id="btnGen">Website erstellen</button>
+    <button id="btnSave">Als HTML speichern</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <div id="preview">💡 Hier erscheint deine generierte Website …</div>
 
   <script>
-    async function generate() {
-      const prompt = document.getElementById("prompt").value;
-      const preview = document.getElementById("preview");
-      preview.innerHTML = "⏳ Die KI erstellt deine Website...";
-      const res = await fetch("http://localhost:8000/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt })
-      });
-      const data = await res.json();
-      preview.innerHTML = data.html;
+    const $ = s => document.querySelector(s);
+    const statusEl = $("#status");
+    const preview  = $("#preview");
+    const setStatus = (m, err=false)=>{ statusEl.textContent=m||""; statusEl.className="status"+(err?" err":""); };
+
+    async function generate(){
+      const prompt = $("#prompt").value.trim();
+      const model  = $("#model").value.trim() || "qwen3-coder:480b-cloud";
+      const max    = parseInt($("#max").value || "1200", 10);
+      if(!prompt){ setStatus("Bitte eine Beschreibung eingeben.", true); return; }
+      setStatus("Erzeuge HTML …");
+      preview.innerHTML = "⏳ Die KI erstellt deine Website …";
+      try{
+        const res = await fetch("/generate", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ prompt, model, max_tokens: max })
+        });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { throw new Error("Ungültige JSON-Antwort: " + text.slice(0,200)); }
+        if(!res.ok){ throw new Error(data?.detail || ("HTTP "+res.status)); }
+        const html = data?.html || "";
+        if(!html) throw new Error("Leere Antwort.");
+        preview.innerHTML = html;
+        const remaining = data?.meta?.ratelimit_remaining ?? "?";
+        setStatus("Fertig. Remaining: " + remaining);
+      }catch(e){
+        setStatus("Fehler: " + e.message, true);
+        preview.innerHTML = "🚫 Fehler beim Generieren.";
+      }
     }
+
+    function saveAsHtml(){
+      const html = preview.innerHTML;
+      if(!html){ setStatus("Nichts zum Speichern.", true); return; }
+      const blob = new Blob([html], {type:"text/html;charset=utf-8"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "website.html";
+      document.body.appendChild(a);
+      a.click(); a.remove();
+      URL.revokeObjectURL(a.href);
+      setStatus("HTML gespeichert.");
+    }
+
+    $("#btnGen").addEventListener("click", generate);
+    $("#btnSave").addEventListener("click", saveAsHtml);
   </script>
 </body>
 </html>
