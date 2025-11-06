@@ -15,10 +15,15 @@
     #preview{margin-top:16px;width:90%;max-width:1100px;background:#0f172a;border-radius:12px;padding:16px;border:1px solid rgba(148,163,184,.25);min-height:240px}
     .status{font-size:13px;color:#94a3b8;margin-top:8px;min-height:18px}
     .err{color:#fca5a5}
+    table{border-collapse:collapse;width:90%;max-width:800px;margin-top:20px;background:#0f172a;border-radius:10px;overflow:hidden}
+    th,td{border:1px solid rgba(148,163,184,.3);padding:8px 10px;text-align:left}
+    th{background:#1e293b;color:#e2e8f0}
+    td{color:#cbd5e1}
+    img.logo{width:120px;margin-bottom:10px;border-radius:12px}
   </style>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text y='.9em' font-size='90'>✨</text></svg>">
 </head>
 <body>
+  <img src="logo.jpg" alt="WebPilot Logo" class="logo">
   <h1>🧠 Website-Generator KI</h1>
   <p style="color:#94a3b8;margin:0 0 8px">Beschreibe deine Website:</p>
   <textarea id="prompt" placeholder="z. B. Moderne Homepage für „Studio Aurora“ mit Hero, Leistungen, Prozess, Referenzen, Kontakt."></textarea>
@@ -32,6 +37,22 @@
   <div class="status" id="status"></div>
 
   <div id="preview">💡 Hier erscheint deine generierte Website …</div>
+
+  <!-- Ergänzte Tabelle -->
+  <table>
+    <thead>
+      <tr><th>Modell</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>deepseek-v3.1:671b-cloud</td><td>stärkstes Gesamtmodell (Reasoning + Coding + Analyse)</td></tr>
+      <tr><td>qwen3-coder:480b-cloud</td><td>beste Codeleistung, stark auch sprachlich</td></tr>
+      <tr><td>glm-4.6:cloud</td><td>sehr gutes Gleichgewicht aus Leistung und Tempo</td></tr>
+      <tr><td>gpt-oss:120b-cloud</td><td>solide Allround-Leistung, aber weniger spezialisiert</td></tr>
+      <tr><td>qwen3-vl:235b-cloud</td><td>stark bei Text + Bild, weniger bei reinem Text</td></tr>
+      <tr><td>minimax-m2:cloud</td><td>leichtgewichtig, schnell, aber weniger präzise</td></tr>
+      <tr><td>gpt-oss:20b-cloud</td><td>kleinste Leistung, geeignet nur für einfache Aufgaben</td></tr>
+    </tbody>
+  </table>
 
   <script>
     const $ = s => document.querySelector(s);
@@ -47,7 +68,6 @@
       setStatus("Erzeuge HTML …");
       preview.innerHTML = "⏳ Die KI erstellt deine Website …";
       try{
-        // Gleiche Origin → relative URL funktioniert, kein CORS.
         const res = await fetch("/generate", {
           method:"POST",
           headers:{"Content-Type":"application/json"},
@@ -55,7 +75,6 @@
         });
         const raw = await res.text();
         if(!res.ok){
-          // zeig Fehlertext an, statt „Failed to fetch“
           throw new Error(`HTTP ${res.status} – ${raw.slice(0,300)}`);
         }
         let data;
