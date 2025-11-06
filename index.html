@@ -17,7 +17,6 @@
     .btn{background:linear-gradient(180deg,var(--accent),var(--accent2));border:1px solid rgba(0,0,0,.25)}
     .btn:hover{filter:brightness(1.08)}
     .btn-ghost{background:#0b1220;border:1px solid rgba(148,163,184,.4)}
-    #preview{margin-top:16px;width:90%;max-width:1100px;background:var(--panel);border-radius:12px;padding:16px;border:1px solid rgba(148,163,184,.25);min-height:240px}
     .status{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px}
     .err{color:#fca5a5}
     .models{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;width:90%;max-width:1100px;margin:10px 0}
@@ -38,8 +37,16 @@
     th{background:#1e293b;color:#e2e8f0}
     td{color:#cbd5e1}
 
-    /* NEU: Frame für isolierte Vorschau, Style passt ins bestehende Design */
-    iframe#frame{width:90%;max-width:1100px;height:70vh;margin-top:12px;border:1px solid rgba(148,163,184,.25);border-radius:12px;background:#ffffff}
+    /* iFrame dunkel (vor Generierung) */
+    iframe#frame{
+      width:90%;
+      max-width:1100px;
+      height:70vh;
+      margin-top:12px;
+      border:1px solid rgba(148,163,184,.25);
+      border-radius:12px;
+      background:var(--panel);
+    }
   </style>
   <link rel="icon" href="/static/logo.jpg">
 </head>
@@ -50,7 +57,6 @@
   <p class="hint">Beschreibe deine Website:</p>
   <textarea id="prompt" placeholder="z. B. One-Pager mit Hero, Leistungen, Galerie (nutze hochgeladene Bilder), Kontakt."></textarea>
 
-  <!-- Modell-Karten -->
   <div class="models" id="models"></div>
   <div class="row">
     <button id="btnGen" class="btn">Website erstellen</button>
@@ -58,7 +64,6 @@
     <button id="btnBundle" class="btn-ghost" disabled>Bundle herunterladen</button>
   </div>
 
-  <!-- Upload -->
   <div class="row">
     <input id="fileInput" type="file" multiple accept="image/*" />
     <button id="btnUpload" class="btn">Bilder hochladen</button>
@@ -71,13 +76,9 @@
 
   <div class="status" id="status"></div>
 
-  <!-- Bestehender Host-Container bleibt. Wird nur als Fallback genutzt. -->
-  <div id="preview" style="margin-top:12px">💡 Hier erscheint deine generierte Website …</div>
-
-  <!-- NEU: Isolierte Vorschau verhindert Style-Leaks -->
+  <!-- Nur die iFrame-Vorschau bleibt -->
   <iframe id="frame" sandbox="allow-same-origin allow-scripts"></iframe>
 
-  <!-- Referenz-Tabelle (ausklappbar optional) -->
   <table>
     <thead><tr><th>Modell</th><th>Beschreibung</th></tr></thead>
     <tbody>
@@ -94,20 +95,18 @@
   <script>
     const $ = s => document.querySelector(s);
     const statusEl = $("#status");
-    const preview  = $("#preview");
     const modelsEl = $("#models");
     const btnBundle = $("#btnBundle");
     const assetsBox = $("#assetsBox");
     const assetsList = $("#assetsList");
-    const frame = $("#frame");                 // NEU
+    const frame = $("#frame");
 
     let currentBundleId = null;
     let currentAssets = [];
-    let selectedModel = "qwen3-coder:480b-cloud"; // Default
+    let selectedModel = "qwen3-coder:480b-cloud";
     let maxTokens = 1800;
     let temperature = 0.20;
 
-    // Spiegel der Server-Presets + Kontextfenster-Anzeige
     const PRESETS = {
       "deepseek-v3.1:671b-cloud": {label:"DeepSeek V3.1", context_window:65536, ideal_max:3000, cap:8000, temp:0.30, note:"64k Kontext, Output bis ~8k"},
       "qwen3-coder:480b-cloud":   {label:"Qwen3 Coder",   context_window:131072,ideal_max:1800, cap:8192, temp:0.20, note:"131k Kontext"},
@@ -125,7 +124,6 @@
       Object.entries(PRESETS).forEach(([key, p])=>{
         const card = document.createElement("div");
         card.className = "card" + (key===selectedModel ? " active":"");
-        card.dataset.key = key;
         card.innerHTML = `
           <div class="top">
             <div class="name">${p.label}</div>
@@ -154,7 +152,6 @@
     renderModelCards();
     applyPreset(selectedModel);
 
-    // ---- Upload ----
     async function uploadFiles(){
       const inp = document.getElementById("fileInput");
       if(!inp.files.length){ setStatus("Bitte Bilder auswählen.", true); return; }
@@ -186,19 +183,16 @@
       assetsBox.style.display = currentAssets.length ? "block" : "none";
     }
 
-    // ---- NEU: sichere Vorschau im iFrame ----
     function renderInIframe(html){
       const doc = frame.contentDocument || frame.contentWindow.document;
       doc.open(); doc.write(html); doc.close();
     }
 
-    // ---- Generate ----
     async function generate(){
       const prompt = document.getElementById("prompt").value.trim();
       if(!prompt){ setStatus("Bitte eine Beschreibung eingeben.", true); return; }
       setStatus("Erzeuge HTML …");
-      // Ladeanzeige im iFrame
-      frame.srcdoc = "<div style='font-family:sans-serif;padding:20px'>⏳ Die KI erstellt deine Website …</div>";
+      frame.srcdoc = "<div style='font-family:sans-serif;color:#e5e7eb;background:#0f172a;padding:20px'>⏳ Die KI erstellt deine Website …</div>";
       try{
         const res = await fetch("/generate", {
           method:"POST",
@@ -218,30 +212,18 @@
         currentBundleId = data.bundle_id;
         btnBundle.disabled = !currentBundleId;
 
-        // Wichtig: wenn Backend html_preview liefert, nimmt das absolute Asset-Pfade.
         const html = data?.html_preview || data?.html || "";
         if(!html) throw new Error("Leere Antwort vom Backend.");
-
-        // Nur iFrame befüllen. Dein Host-Design bleibt unverändert.
         renderInIframe(html);
-        setStatus("Fertig. Vorschau isoliert im iFrame.");
-
-        if (data.applied){
-          const a = data.applied;
-          maxTokens = a.chosen_max;
-          temperature = a.temperature;
-          setStatus(`Server angewandt → Modell ${a.model_canonical} • ctx ${(a.context_window/1024).toFixed(0)}k • max_tokens ${a.chosen_max} / cap ${a.cap} • temp ${a.temperature}`);
-        }
+        setStatus("Fertig. Vorschau im iFrame geladen.");
       }catch(e){
         setStatus("Fehler: "+e.message, true);
-        frame.srcdoc = "<div style='font-family:sans-serif;color:#b91c1c;padding:20px'>🚫 Fehler beim Generieren.</div>";
+        frame.srcdoc = "<div style='font-family:sans-serif;color:#fca5a5;padding:20px'>🚫 Fehler beim Generieren.</div>";
         console.error(e);
       }
     }
 
-    // ---- Save HTML clientseitig ----
     function saveAsHtml(){
-      // Speichert die iFrame-Seite, nicht dein Host.
       const doc = frame.contentDocument || frame.contentWindow.document;
       const html = doc?.documentElement?.outerHTML || "";
       if(!html){ setStatus("Nichts zum Speichern.", true); return; }
@@ -255,7 +237,6 @@
       setStatus("HTML gespeichert.");
     }
 
-    // ---- Bundle ZIP ----
     function downloadBundle(){
       if(!currentBundleId){ setStatus("Kein Bundle vorhanden.", true); return; }
       const a = document.createElement("a");
@@ -266,10 +247,10 @@
       setStatus("Bundle wird heruntergeladen.");
     }
 
-    document.getElementById("btnUpload").addEventListener("click", uploadFiles);
-    document.getElementById("btnGen").addEventListener("click", generate);
-    document.getElementById("btnSave").addEventListener("click", saveAsHtml);
-    document.getElementById("btnBundle").addEventListener("click", downloadBundle);
+    $("#btnUpload").addEventListener("click", uploadFiles);
+    $("#btnGen").addEventListener("click", generate);
+    $("#btnSave").addEventListener("click", saveAsHtml);
+    $("#btnBundle").addEventListener("click", downloadBundle);
   </script>
 </body>
 </html>
