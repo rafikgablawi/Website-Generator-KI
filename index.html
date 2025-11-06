@@ -20,11 +20,26 @@
     #preview{margin-top:16px;width:90%;max-width:1100px;background:var(--panel);border-radius:12px;padding:16px;border:1px solid rgba(148,163,184,.25);min-height:240px}
     .status{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px}
     .err{color:#fca5a5}
+    .models{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;width:90%;max-width:1100px;margin:10px 0}
+    .card{border:1px solid var(--border);background:var(--panel);border-radius:12px;padding:12px;cursor:pointer;transition:transform .05s ease}
+    .card:hover{transform:translateY(-1px)}
+    .card.active{outline:2px solid var(--accent)}
+    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+    .name{font-weight:bold}
+    .badge{font-size:12px;color:#cbd5e1}
+    .bar{height:8px;background:#0e152e;border-radius:6px;overflow:hidden;margin:8px 0}
+    .fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%}
+    .meta{font-size:12px;color:#9fb1cc}
     .assets{width:90%;max-width:900px;color:var(--muted);font-size:13px}
     .assets ul{margin:6px 0 0 16px;padding:0}
-    .assets li{margin:4px 0}
-    .thumb{display:inline-flex;align-items:center;gap:8px;margin:2px 0}
-    .thumb img{width:44px;height:44px;object-fit:cover;border-radius:6px;border:1px solid var(--border)}
+    .assets li{margin:2px 0}
+    table{border-collapse:collapse;width:90%;max-width:900px;margin-top:16px;background:var(--panel);border-radius:10px;overflow:hidden}
+    th,td{border:1px solid var(--border);padding:8px 10px;text-align:left}
+    th{background:#1e293b;color:#e2e8f0}
+    td{color:#cbd5e1}
+
+    /* NEU: Frame für isolierte Vorschau, Style passt ins bestehende Design */
+    iframe#frame{width:90%;max-width:1100px;height:70vh;margin-top:12px;border:1px solid rgba(148,163,184,.25);border-radius:12px;background:#ffffff}
   </style>
   <link rel="icon" href="/static/logo.jpg">
 </head>
@@ -35,16 +50,15 @@
   <p class="hint">Beschreibe deine Website:</p>
   <textarea id="prompt" placeholder="z. B. One-Pager mit Hero, Leistungen, Galerie (nutze hochgeladene Bilder), Kontakt."></textarea>
 
-  <div class="row" id="modelRow">
-    <!-- Modellkarten werden per JS gerendert -->
-  </div>
-
+  <!-- Modell-Karten -->
+  <div class="models" id="models"></div>
   <div class="row">
     <button id="btnGen" class="btn">Website erstellen</button>
     <button id="btnSave" class="btn-ghost">Als HTML speichern</button>
     <button id="btnBundle" class="btn-ghost" disabled>Bundle herunterladen</button>
   </div>
 
+  <!-- Upload -->
   <div class="row">
     <input id="fileInput" type="file" multiple accept="image/*" />
     <button id="btnUpload" class="btn">Bilder hochladen</button>
@@ -56,61 +70,93 @@
   </div>
 
   <div class="status" id="status"></div>
-  <div id="preview">💡 Hier erscheint deine generierte Website …</div>
+
+  <!-- Bestehender Host-Container bleibt. Wird nur als Fallback genutzt. -->
+  <div id="preview" style="margin-top:12px">💡 Hier erscheint deine generierte Website …</div>
+
+  <!-- NEU: Isolierte Vorschau verhindert Style-Leaks -->
+  <iframe id="frame" sandbox="allow-same-origin allow-scripts"></iframe>
+
+  <!-- Referenz-Tabelle (ausklappbar optional) -->
+  <table>
+    <thead><tr><th>Modell</th><th>Beschreibung</th></tr></thead>
+    <tbody>
+      <tr><td>deepseek-v3.1:671b-cloud</td><td>stärkstes Gesamtmodell (Reasoning + Coding + Analyse)</td></tr>
+      <tr><td>qwen3-coder:480b-cloud</td><td>beste Codeleistung, stark auch sprachlich</td></tr>
+      <tr><td>glm-4.6:cloud</td><td>gutes Gleichgewicht aus Leistung und Tempo</td></tr>
+      <tr><td>gpt-oss:120b-cloud</td><td>solider Allrounder</td></tr>
+      <tr><td>qwen3-vl:235b-cloud</td><td>stark für Text+Bild</td></tr>
+      <tr><td>minimax-m2:cloud</td><td>leichtgewichtig, schnell</td></tr>
+      <tr><td>gpt-oss:20b-cloud</td><td>kleine Aufgaben</td></tr>
+    </tbody>
+  </table>
 
   <script>
     const $ = s => document.querySelector(s);
     const statusEl = $("#status");
     const preview  = $("#preview");
+    const modelsEl = $("#models");
+    const btnBundle = $("#btnBundle");
     const assetsBox = $("#assetsBox");
     const assetsList = $("#assetsList");
-    const btnBundle = $("#btnBundle");
-    const modelsRow = $("#modelRow");
+    const frame = $("#frame");                 // NEU
 
     let currentBundleId = null;
     let currentAssets = [];
-    let selectedModel = "qwen3-coder:480b-cloud";
+    let selectedModel = "qwen3-coder:480b-cloud"; // Default
     let maxTokens = 1800;
     let temperature = 0.20;
 
+    // Spiegel der Server-Presets + Kontextfenster-Anzeige
     const PRESETS = {
-      "deepseek-v3.1:671b-cloud": {label:"DeepSeek V3.1", ctx:65536,  ideal:3000, cap:8000, temp:0.30},
-      "qwen3-coder:480b-cloud":   {label:"Qwen3 Coder",   ctx:131072, ideal:1800, cap:8192, temp:0.20},
-      "glm-4.6:cloud":            {label:"GLM-4.6",       ctx:131072, ideal:1600, cap:8192, temp:0.35},
-      "gpt-oss:120b-cloud":       {label:"GPT-OSS 120B",  ctx:65536,  ideal:1400, cap:8192, temp:0.35},
-      "qwen3-vl:235b-cloud":      {label:"Qwen3-VL",      ctx:262144, ideal:1500, cap:6144, temp:0.40},
-      "minimax-m2:cloud":         {label:"MiniMax-M2",    ctx:200000, ideal:1200, cap:8192, temp:0.40},
-      "gpt-oss:20b-cloud":        {label:"GPT-OSS 20B",   ctx:32768,  ideal:900,  cap:4096, temp:0.45},
+      "deepseek-v3.1:671b-cloud": {label:"DeepSeek V3.1", context_window:65536, ideal_max:3000, cap:8000, temp:0.30, note:"64k Kontext, Output bis ~8k"},
+      "qwen3-coder:480b-cloud":   {label:"Qwen3 Coder",   context_window:131072,ideal_max:1800, cap:8192, temp:0.20, note:"131k Kontext"},
+      "glm-4.6:cloud":            {label:"GLM-4.6",       context_window:131072,ideal_max:1600, cap:8192, temp:0.35, note:"~128k Kontext"},
+      "gpt-oss:120b-cloud":       {label:"GPT-OSS 120B",  context_window:65536, ideal_max:1400, cap:8192, temp:0.35, note:"~64k Kontext"},
+      "qwen3-vl:235b-cloud":      {label:"Qwen3-VL",      context_window:262144,ideal_max:1500, cap:6144, temp:0.40, note:"256k Kontext"},
+      "minimax-m2:cloud":         {label:"MiniMax-M2",    context_window:200000,ideal_max:1200, cap:8192, temp:0.40, note:"200k+ Kontext"},
+      "gpt-oss:20b-cloud":        {label:"GPT-OSS 20B",   context_window:32768, ideal_max:900,  cap:4096, temp:0.45, note:"32k Kontext"},
     };
 
     function setStatus(m, err=false){ statusEl.textContent=m||""; statusEl.className="status"+(err?" err":""); }
 
     function renderModelCards(){
-      modelsRow.innerHTML = "";
+      modelsEl.innerHTML = "";
       Object.entries(PRESETS).forEach(([key, p])=>{
-        const card = document.createElement("button");
-        card.type = "button";
-        card.style.cssText = "border:1px solid var(--border);background:var(--panel);border-radius:12px;padding:10px;cursor:pointer;min-width:210px";
+        const card = document.createElement("div");
+        card.className = "card" + (key===selectedModel ? " active":"");
+        card.dataset.key = key;
         card.innerHTML = `
-          <div style="display:flex;justify-content:space-between;gap:12px">
-            <div><b>${p.label}</b><br><span style="font-size:12px;color:#9fb1cc">${(p.ctx/1024).toFixed(0)}k ctx</span></div>
-            <div style="font-size:12px;color:#cbd5e1;text-align:right">ideal ${p.ideal}<br>cap ${p.cap}<br>temp ${p.temp}</div>
+          <div class="top">
+            <div class="name">${p.label}</div>
+            <div class="badge">${(p.context_window/1024).toFixed(0)}k ctx</div>
           </div>
+          <div class="bar"><div class="fill" style="width:${Math.min(100, (p.ideal_max/p.cap)*100)}%"></div></div>
+          <div class="meta">ideal: ${p.ideal_max} • cap: ${p.cap} • temp: ${p.temp} <br><span style="opacity:.8">${p.note}</span></div>
         `;
         card.addEventListener("click", ()=>{
-          selectedModel = key;
-          maxTokens = p.ideal;
-          temperature = p.temp;
-          setStatus(`Modell: ${p.label} • ctx ${(p.ctx/1024).toFixed(0)}k • max_tokens ${maxTokens} (cap ${p.cap}) • temp ${temperature}`);
+          document.querySelectorAll(".card").forEach(c=>c.classList.remove("active"));
+          card.classList.add("active");
+          applyPreset(key);
         });
-        modelsRow.appendChild(card);
+        modelsEl.appendChild(card);
       });
     }
-    renderModelCards();
-    setStatus(`Modell: ${PRESETS[selectedModel].label} • ctx ${(PRESETS[selectedModel].ctx/1024).toFixed(0)}k • max_tokens ${maxTokens}`);
 
+    function applyPreset(key){
+      const p = PRESETS[key] || PRESETS["qwen3-coder:480b-cloud"];
+      selectedModel = key;
+      maxTokens = p.ideal_max;
+      temperature = p.temp;
+      setStatus(`Modell: ${p.label} • ctx ${(p.context_window/1024).toFixed(0)}k • max_tokens ${p.ideal_max} (cap ${p.cap})`);
+    }
+
+    renderModelCards();
+    applyPreset(selectedModel);
+
+    // ---- Upload ----
     async function uploadFiles(){
-      const inp = $("#fileInput");
+      const inp = document.getElementById("fileInput");
       if(!inp.files.length){ setStatus("Bitte Bilder auswählen.", true); return; }
       const fd = new FormData();
       for(const f of inp.files){ fd.append("files", f, f.name); }
@@ -134,26 +180,25 @@
       assetsList.innerHTML = "";
       for(const n of currentAssets){
         const li = document.createElement("li");
-        li.className = "thumb";
-        const img = document.createElement("img");
-        if(currentBundleId){
-          img.src = `/bundles/${currentBundleId}/assets/${encodeURIComponent(n)}`;
-        }
-        img.alt = n;
-        li.appendChild(img);
-        const span = document.createElement("span");
-        span.textContent = n;
-        li.appendChild(span);
+        li.textContent = n;
         assetsList.appendChild(li);
       }
       assetsBox.style.display = currentAssets.length ? "block" : "none";
     }
 
+    // ---- NEU: sichere Vorschau im iFrame ----
+    function renderInIframe(html){
+      const doc = frame.contentDocument || frame.contentWindow.document;
+      doc.open(); doc.write(html); doc.close();
+    }
+
+    // ---- Generate ----
     async function generate(){
-      const prompt = $("#prompt").value.trim();
+      const prompt = document.getElementById("prompt").value.trim();
       if(!prompt){ setStatus("Bitte eine Beschreibung eingeben.", true); return; }
       setStatus("Erzeuge HTML …");
-      preview.innerHTML = "⏳ Die KI erstellt deine Website …";
+      // Ladeanzeige im iFrame
+      frame.srcdoc = "<div style='font-family:sans-serif;padding:20px'>⏳ Die KI erstellt deine Website …</div>";
       try{
         const res = await fetch("/generate", {
           method:"POST",
@@ -173,40 +218,44 @@
         currentBundleId = data.bundle_id;
         btnBundle.disabled = !currentBundleId;
 
-        // Wichtig: Vorschau-HTML mit absoluten Bundle-Pfaden verwenden
+        // Wichtig: wenn Backend html_preview liefert, nimmt das absolute Asset-Pfade.
         const html = data?.html_preview || data?.html || "";
         if(!html) throw new Error("Leere Antwort vom Backend.");
-        preview.innerHTML = html;
+
+        // Nur iFrame befüllen. Dein Host-Design bleibt unverändert.
+        renderInIframe(html);
+        setStatus("Fertig. Vorschau isoliert im iFrame.");
 
         if (data.applied){
           const a = data.applied;
           maxTokens = a.chosen_max;
           temperature = a.temperature;
-          setStatus(`Server angewandt → ${a.model_canonical} • ctx ${(a.context_window/1024).toFixed(0)}k • max_tokens ${a.chosen_max} / cap ${a.cap} • temp ${a.temperature}`);
-        } else {
-          setStatus("Fertig. Du kannst jetzt das Bundle herunterladen.");
+          setStatus(`Server angewandt → Modell ${a.model_canonical} • ctx ${(a.context_window/1024).toFixed(0)}k • max_tokens ${a.chosen_max} / cap ${a.cap} • temp ${a.temperature}`);
         }
       }catch(e){
         setStatus("Fehler: "+e.message, true);
-        preview.innerHTML = "🚫 Fehler beim Generieren.";
+        frame.srcdoc = "<div style='font-family:sans-serif;color:#b91c1c;padding:20px'>🚫 Fehler beim Generieren.</div>";
         console.error(e);
       }
     }
 
+    // ---- Save HTML clientseitig ----
     function saveAsHtml(){
-      // Speichert nur die sichtbare Vorschau. Für vollständiges Projekt: ZIP nutzen.
-      const html = preview.innerHTML;
+      // Speichert die iFrame-Seite, nicht dein Host.
+      const doc = frame.contentDocument || frame.contentWindow.document;
+      const html = doc?.documentElement?.outerHTML || "";
       if(!html){ setStatus("Nichts zum Speichern.", true); return; }
       const blob = new Blob([html], {type:"text/html;charset=utf-8"});
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = "website_preview.html";
+      a.download = "website.html";
       document.body.appendChild(a);
       a.click(); a.remove();
       URL.revokeObjectURL(a.href);
       setStatus("HTML gespeichert.");
     }
 
+    // ---- Bundle ZIP ----
     function downloadBundle(){
       if(!currentBundleId){ setStatus("Kein Bundle vorhanden.", true); return; }
       const a = document.createElement("a");
@@ -217,10 +266,10 @@
       setStatus("Bundle wird heruntergeladen.");
     }
 
-    $("#btnUpload").addEventListener("click", uploadFiles);
-    $("#btnGen").addEventListener("click", generate);
-    $("#btnSave").addEventListener("click", saveAsHtml);
-    $("#btnBundle").addEventListener("click", downloadBundle);
+    document.getElementById("btnUpload").addEventListener("click", uploadFiles);
+    document.getElementById("btnGen").addEventListener("click", generate);
+    document.getElementById("btnSave").addEventListener("click", saveAsHtml);
+    document.getElementById("btnBundle").addEventListener("click", downloadBundle);
   </script>
 </body>
 </html>
