@@ -1,83 +1,138 @@
 # server.py
-import os, re, time
+import os, re, time, io, zipfile, uuid, shutil
 from pathlib import Path
+from typing import List, Optional, Tuple
+
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# --- Konfiguration ---
-OLLAMA_API_KEY     = os.getenv("OLLAMA_API_KEY", "").strip()
-OLLAMA_CLOUD_BASE  = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
+# ---------- Verzeichnisse ----------
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_DIR = BASE_DIR / "static"
+PUBLIC_DIR.mkdir(exist_ok=True)
+BUNDLES_DIR = BASE_DIR / "bundles"
+BUNDLES_DIR.mkdir(exist_ok=True)
 
-BASE_DIR   = Path(__file__).resolve().parent
-INDEX_FILE = BASE_DIR / "index.html"
-STATIC_DIR = BASE_DIR / "static"
-STATIC_DIR.mkdir(exist_ok=True)
+# ---------- Provider-Konfiguration ----------
+OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY", "").strip()
+OLLAMA_CLOUD_BASE = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
 
-# --- FastAPI ---
+# ---------- Modell-Presets ----------
+# context_window = recherchierte Kontextfenster (Tokens)
+# cap = serverseitige Obergrenze für AUSGABE-Token (max_tokens)
+# ideal_max = praxisnaher Default für AUSGABE-Token
+# temperature = moderater, modellangepasster Default
+MODEL_PRESETS = {
+    # DeepSeek V3: öffentlich diskutierte 64k Kontext, übliche Output-Limits 4–8k
+    "deepseek-v3.1:671b-cloud": {"context_window": 65536, "ideal_max": 3000, "cap": 8000, "temperature": 0.30},
+    # Qwen 2.5 Coder: 131k Kontext; Output meist <=8k bei Cloud-APIs
+    "qwen3-coder:480b-cloud":   {"context_window": 131072, "ideal_max": 1800, "cap": 8192, "temperature": 0.20},
+    # GLM-4.6: Serie mit 32k–128k Kontext (konservativ 128k), Output konservativ 8k
+    "glm-4.6:cloud":            {"context_window": 131072, "ideal_max": 1600, "cap": 8192, "temperature": 0.35},
+    # GPT-OSS 120B: generische OSS-Variante; konservative Defaults
+    "gpt-oss:120b-cloud":       {"context_window": 65536, "ideal_max": 1400, "cap": 8192, "temperature": 0.35},
+    # Qwen3-VL: Long-context multimodal bis 256k; Output konservativ 6k
+    "qwen3-vl:235b-cloud":      {"context_window": 262144, "ideal_max": 1500, "cap": 6144, "temperature": 0.40},
+    # MiniMax-M2: API nennt 200k+ Kontext; Output konservativ 8k
+    "minimax-m2:cloud":         {"context_window": 200000, "ideal_max": 1200, "cap": 8192, "temperature": 0.40},
+    # GPT-OSS 20B: kleine OSS-Variante
+    "gpt-oss:20b-cloud":        {"context_window": 32768,  "ideal_max": 900,  "cap": 4096, "temperature": 0.45},
+}
+
+MODEL_ALIASES = {
+    "deepseek": "deepseek-v3.1:671b-cloud",
+    "qwen3-coder": "qwen3-coder:480b-cloud",
+    "glm-4.6": "glm-4.6:cloud",
+    "gpt-oss:120b": "gpt-oss:120b-cloud",
+    "qwen3-vl": "qwen3-vl:235b-cloud",
+    "minimax-m2": "minimax-m2:cloud",
+    "gpt-oss:20b": "gpt-oss:20b-cloud",
+}
+
+def resolve_model(name: str) -> str:
+    n = (name or "").strip().lower()
+    for key, canonical in MODEL_ALIASES.items():
+        if key in n:
+            return canonical
+    return name if name in MODEL_PRESETS else "qwen3-coder:480b-cloud"
+
+def choose_tokens_and_temp(model: str, requested_max: Optional[int], req_temp: Optional[float]):
+    canon = resolve_model(model)
+    preset = MODEL_PRESETS.get(canon, MODEL_PRESETS["qwen3-coder:480b-cloud"])
+    cap = int(preset["cap"])
+    ideal = int(preset["ideal_max"])
+    chosen_max = max(300, min(int(requested_max or ideal), cap))
+    temperature = float(req_temp if req_temp is not None else preset["temperature"])
+    meta = {
+        "model_canonical": canon,
+        "context_window": preset["context_window"],
+        "ideal_max": ideal,
+        "cap": cap,
+        "chosen_max": chosen_max,
+        "temperature": temperature,
+    }
+    return chosen_max, temperature, meta
+
+# ---------- App ----------
 app = FastAPI(title="Website-Generator KI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Render + lokal problemlos
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
-# Statische Dateien unter /static bereitstellen
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR)), name="static")
 
-# --- Routen ---
-@app.get("/")
+INDEX_FILE = BASE_DIR / "index.html"
+
+@app.get("/", response_class=HTMLResponse)
 def root():
     if INDEX_FILE.exists():
-        return FileResponse(str(INDEX_FILE), media_type="text/html; charset=utf-8")
-    return JSONResponse({"error": "index.html fehlt"}, status_code=404)
-
-# Alias, damit /logo.jpg direkt funktioniert (Render-Logs zeigten 404 darauf)
-@app.get("/logo.jpg")
-def logo_alias():
-    path = STATIC_DIR / "logo.jpg"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="logo.jpg fehlt unter static/")
-    return FileResponse(str(path), media_type="image/jpeg")
+        return INDEX_FILE.read_text(encoding="utf-8")
+    return HTMLResponse("<h1>index.html fehlt</h1>", status_code=404)
 
 @app.get("/health")
 def health():
     return {"ok": True, "api_key_set": bool(OLLAMA_API_KEY), "base": OLLAMA_CLOUD_BASE}
 
-# --- Datamodel ---
-class Req(BaseModel):
+# ---------- Schemas ----------
+class GenReq(BaseModel):
     prompt: str
-    model: str | None = "qwen3-coder:480b-cloud"
-    max_tokens: int | None = 1000
-    temperature: float | None = 0.4
+    model: Optional[str] = "qwen3-coder:480b-cloud"
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    bundle_id: Optional[str] = None
+    image_names: Optional[List[str]] = None
 
-# --- Helper ---
-def _strip_fences(txt: str) -> str:
+# ---------- Helpers ----------
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+def safe_name(name: str) -> str:
+    name = SAFE_NAME_RE.sub("", name.strip().replace(" ", "_"))
+    return name.lstrip(".").replace("/", "").replace("\\", "") or f"file_{uuid.uuid4().hex[:8]}"
+
+def strip_fences(txt: str) -> str:
     if not txt:
         return txt
     txt = re.sub(r"^\s*```[a-zA-Z0-9]*\s*", "", txt.strip())
     txt = re.sub(r"\s*```\s*$", "", txt)
     return txt.strip()
 
-async def _call_ollama(payload: dict) -> dict:
+async def call_provider(payload: dict) -> dict:
     if not OLLAMA_API_KEY:
         raise HTTPException(status_code=500, detail="OLLAMA_API_KEY fehlt")
     url = f"{OLLAMA_CLOUD_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OLLAMA_API_KEY}",
-        "Content-Type": "application/json",
-        "Connection": "keep-alive",
-    }
+    headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}", "Content-Type": "application/json"}
     limits  = httpx.Limits(max_keepalive_connections=2, max_connections=4)
     timeout = httpx.Timeout(connect=10.0, read=60.0, write=20.0, pool=20.0)
     retriable = {408, 502, 503, 504}
-
     async with httpx.AsyncClient(http2=False, limits=limits, timeout=timeout) as client:
         backoff = 1.0
         for attempt in range(2):
@@ -93,25 +148,62 @@ async def _call_ollama(payload: dict) -> dict:
                     time.sleep(1.5); continue
                 raise HTTPException(status_code=502, detail=f"Netzwerkfehler: {e}")
 
-# --- API ---
+def ensure_bundle(bundle_id: Optional[str]) -> str:
+    bid = bundle_id or uuid.uuid4().hex[:12]
+    (BUNDLES_DIR / bid / "assets").mkdir(parents=True, exist_ok=True)
+    return bid
+
+def write_html(bundle_id: str, html: str) -> Path:
+    out = BUNDLES_DIR / bundle_id / "index.html"
+    out.write_text(html, encoding="utf-8")
+    return out
+
+def fix_img_paths(html: str, image_names: List[str]) -> str:
+    for name in image_names:
+        base = name.split("/")[-1]
+        html = re.sub(rf'(["\'(]){re.escape(base)}([)"\'])', rf'\1assets/{base}\2', html)
+    return html
+
+# ---------- Upload ----------
+@app.post("/upload")
+async def upload(files: List[UploadFile] = File(...), bundle_id: Optional[str] = Form(None)):
+    bid = ensure_bundle(bundle_id)
+    assets = BUNDLES_DIR / bid / "assets"
+    saved = []
+    for uf in files:
+        name = safe_name(uf.filename or "upload")
+        (assets / name).write_bytes(await uf.read())
+        saved.append(name)
+    return {"bundle_id": bid, "assets": saved}
+
+# ---------- Generate ----------
 @app.post("/generate")
-async def generate(req: Req):
-    prompt = (req.prompt or "").strip()
-    if not prompt:
+async def generate(req: GenReq):
+    if not req.prompt:
         raise HTTPException(status_code=400, detail="prompt fehlt")
 
-    model       = (req.model or "qwen3-coder:480b-cloud").strip()
-    max_tokens  = int(req.max_tokens or 1000)
-    temperature = float(req.temperature if req.temperature is not None else 0.4)
+    max_tokens, temperature, picked = choose_tokens_and_temp(req.model, req.max_tokens, req.temperature)
+    model = picked["model_canonical"]
+
+    bid = ensure_bundle(req.bundle_id)
+    assets_dir = BUNDLES_DIR / bid / "assets"
+    images_on_disk = sorted([p.name for p in assets_dir.glob("*") if p.is_file()])
+    names = [n for n in (req.image_names or images_on_disk) if (assets_dir / n).exists()]
 
     system = (
-        "Du bist ein KI-Webdesigner. Antworte ausschließlich mit einem vollständigen, "
-        "lauffähigen HTML-Dokument mit eingebettetem CSS. Keine externen Skripte/Fonts."
+        "Du bist ein KI-Webdesigner. Antworte NUR mit einem vollständigen, lauffähigen "
+        "HTML-Dokument mit eingebettetem CSS. Keine externen Skripte/Fonts. "
+        "Verwende Bilder als <img src=\"assets/NAME\" alt=\"...\">."
     )
+
+    images_block = ("Verfügbare Bilder:\n" + "\n".join([f"- assets/{n}" for n in names]) + "\n") if names else ""
+
     user = (
-        f"Erstelle eine moderne One-Page-Website basierend auf:\n\n{prompt}\n\n"
-        "- responsiv, gut lesbar\n- dezentes Design\n- keine externen Abhängigkeiten\n"
-        "- gib NUR das vollständige HTML-Dokument zurück"
+        f"Erstelle eine moderne One-Page-Website basierend auf:\n\n{req.prompt}\n\n"
+        f"{images_block}"
+        "- Nutze die vorhandenen Bilder sinnvoll (Hero, Galerie, Features, Team, Kontakt). "
+        "Semantisches HTML, responsives CSS, dunkles Theme erlaubt. "
+        "Gib ausschließlich das vollständige HTML-Dokument zurück."
     )
 
     payload = {
@@ -125,10 +217,9 @@ async def generate(req: Req):
         "stream": False,
     }
 
-    data = await _call_ollama(payload)
+    data = await call_provider(payload)
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    html = _strip_fences(content)
-
+    html = strip_fences(content)
     if "<html" not in html.lower():
         html = (
             "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
@@ -137,10 +228,29 @@ async def generate(req: Req):
             f"</head><body><h1>Entwurf</h1><pre>{content}</pre></body></html>"
         )
 
-    usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
-    return {"html": html, "meta": usage}
+    if names:
+        html = fix_img_paths(html, names)
 
-# --- Start (Render setzt $PORT) ---
+    write_html(bid, html)
+    usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
+    return {"bundle_id": bid, "html": html, "meta": usage, "assets": names, "applied": picked}
+
+# ---------- ZIP ----------
+@app.get("/bundle/{bundle_id}.zip")
+def download_bundle(bundle_id: str):
+    bundle_dir = BUNDLES_DIR / bundle_id
+    if not bundle_dir.exists():
+        raise HTTPException(status_code=404, detail="Bundle nicht gefunden")
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for path in bundle_dir.rglob("*"):
+            if path.is_file():
+                z.write(path, arcname=str(path.relative_to(bundle_dir)))
+    mem.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename="{bundle_id}.zip"'}
+    return StreamingResponse(mem, media_type="application/zip", headers=headers)
+
+# ---------- Start ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
