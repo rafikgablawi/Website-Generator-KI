@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,31 +18,20 @@ BUNDLES_DIR = BASE_DIR / "bundles"
 BUNDLES_DIR.mkdir(exist_ok=True)
 
 # ---------- Provider-Konfiguration ----------
+from dotenv import load_dotenv; load_dotenv()
 OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_CLOUD_BASE = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
 
 # ---------- Modell-Presets ----------
-# context_window = recherchierte Kontextfenster (Tokens)
-# cap = serverseitige Obergrenze für AUSGABE-Token (max_tokens)
-# ideal_max = praxisnaher Default für AUSGABE-Token
-# temperature = moderater, modellangepasster Default
 MODEL_PRESETS = {
-    # DeepSeek V3: öffentlich diskutierte 64k Kontext, übliche Output-Limits 4–8k
-    "deepseek-v3.1:671b-cloud": {"context_window": 65536, "ideal_max": 3000, "cap": 8000, "temperature": 0.30},
-    # Qwen 2.5 Coder: 131k Kontext; Output meist <=8k bei Cloud-APIs
+    "deepseek-v3.1:671b-cloud": {"context_window": 65536,  "ideal_max": 3000, "cap": 8000, "temperature": 0.30},
     "qwen3-coder:480b-cloud":   {"context_window": 131072, "ideal_max": 1800, "cap": 8192, "temperature": 0.20},
-    # GLM-4.6: Serie mit 32k–128k Kontext (konservativ 128k), Output konservativ 8k
     "glm-4.6:cloud":            {"context_window": 131072, "ideal_max": 1600, "cap": 8192, "temperature": 0.35},
-    # GPT-OSS 120B: generische OSS-Variante; konservative Defaults
-    "gpt-oss:120b-cloud":       {"context_window": 65536, "ideal_max": 1400, "cap": 8192, "temperature": 0.35},
-    # Qwen3-VL: Long-context multimodal bis 256k; Output konservativ 6k
+    "gpt-oss:120b-cloud":       {"context_window": 65536,  "ideal_max": 1400, "cap": 8192, "temperature": 0.35},
     "qwen3-vl:235b-cloud":      {"context_window": 262144, "ideal_max": 1500, "cap": 6144, "temperature": 0.40},
-    # MiniMax-M2: API nennt 200k+ Kontext; Output konservativ 8k
     "minimax-m2:cloud":         {"context_window": 200000, "ideal_max": 1200, "cap": 8192, "temperature": 0.40},
-    # GPT-OSS 20B: kleine OSS-Variante
     "gpt-oss:20b-cloud":        {"context_window": 32768,  "ideal_max": 900,  "cap": 4096, "temperature": 0.45},
 }
-
 MODEL_ALIASES = {
     "deepseek": "deepseek-v3.1:671b-cloud",
     "qwen3-coder": "qwen3-coder:480b-cloud",
@@ -79,15 +68,13 @@ def choose_tokens_and_temp(model: str, requested_max: Optional[int], req_temp: O
 
 # ---------- App ----------
 app = FastAPI(title="Website-Generator KI")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET","POST","OPTIONS"],
     allow_headers=["*"],
 )
-
 app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR)), name="static")
 
 INDEX_FILE = BASE_DIR / "index.html"
@@ -103,6 +90,7 @@ def health():
     return {"ok": True, "api_key_set": bool(OLLAMA_API_KEY), "base": OLLAMA_CLOUD_BASE}
 
 # ---------- Schemas ----------
+from typing import Dict
 class GenReq(BaseModel):
     prompt: str
     model: Optional[str] = "qwen3-coder:480b-cloud"
@@ -113,14 +101,12 @@ class GenReq(BaseModel):
 
 # ---------- Helpers ----------
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
 def safe_name(name: str) -> str:
     name = SAFE_NAME_RE.sub("", name.strip().replace(" ", "_"))
     return name.lstrip(".").replace("/", "").replace("\\", "") or f"file_{uuid.uuid4().hex[:8]}"
 
 def strip_fences(txt: str) -> str:
-    if not txt:
-        return txt
+    if not txt: return txt
     txt = re.sub(r"^\s*```[a-zA-Z0-9]*\s*", "", txt.strip())
     txt = re.sub(r"\s*```\s*$", "", txt)
     return txt.strip()
@@ -158,23 +144,37 @@ def write_html(bundle_id: str, html: str) -> Path:
     out.write_text(html, encoding="utf-8")
     return out
 
-def fix_img_paths(html: str, image_names: List[str]) -> str:
+def fix_img_paths_relative(html: str, image_names: List[str]) -> str:
+    # sorge dafür, dass nackte Dateinamen zu assets/NAME werden
     for name in image_names:
         base = name.split("/")[-1]
         html = re.sub(rf'(["\'(]){re.escape(base)}([)"\'])', rf'\1assets/{base}\2', html)
     return html
 
+def absolutize_for_preview(html: str, bundle_id: str) -> str:
+    # assets/... -> /bundles/{id}/assets/...
+    return re.sub(r'(["\'(])assets/', rf'\1/bundles/{bundle_id}/assets/', html)
+
 # ---------- Upload ----------
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...), bundle_id: Optional[str] = Form(None)):
     bid = ensure_bundle(bundle_id)
-    assets = BUNDLES_DIR / bid / "assets"
+    assets_dir = BUNDLES_DIR / bid / "assets"
     saved = []
     for uf in files:
         name = safe_name(uf.filename or "upload")
-        (assets / name).write_bytes(await uf.read())
+        (assets_dir / name).write_bytes(await uf.read())
         saved.append(name)
     return {"bundle_id": bid, "assets": saved}
+
+# ---------- Serve bundle assets for preview ----------
+@app.get("/bundles/{bundle_id}/assets/{filename:path}")
+def serve_bundle_asset(bundle_id: str, filename: str):
+    safe = safe_name(Path(filename).name)
+    file_path = BUNDLES_DIR / bundle_id / "assets" / safe
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="asset not found")
+    return FileResponse(str(file_path))
 
 # ---------- Generate ----------
 @app.post("/generate")
@@ -190,20 +190,24 @@ async def generate(req: GenReq):
     images_on_disk = sorted([p.name for p in assets_dir.glob("*") if p.is_file()])
     names = [n for n in (req.image_names or images_on_disk) if (assets_dir / n).exists()]
 
+    # Strenger Systemprompt: Bilder MÜSSEN eingebaut werden.
     system = (
         "Du bist ein KI-Webdesigner. Antworte NUR mit einem vollständigen, lauffähigen "
-        "HTML-Dokument mit eingebettetem CSS. Keine externen Skripte/Fonts. "
-        "Verwende Bilder als <img src=\"assets/NAME\" alt=\"...\">."
+        "HTML-Dokument inkl. eingebettetem CSS. Keine externen Skripte/Fonts.\n"
+        "Wenn Bilder vorhanden sind, MUSST du sie sichtbar einbauen. "
+        "Nutze dafür <img src=\"assets/NAME\" alt=\"…\"> und verwende mehrere Bereiche: "
+        "Hero mit großem Bild, Galerie/Portfolio-Grid, und ggf. Feature-Sektion mit kleineren Thumbnails."
     )
 
-    images_block = ("Verfügbare Bilder:\n" + "\n".join([f"- assets/{n}" for n in names]) + "\n") if names else ""
+    images_block = ""
+    if names:
+        images_block = "Verfügbare Bilder (verwende nach Möglichkeit alle):\n" + "\n".join([f"- assets/{n}" for n in names]) + "\n"
 
     user = (
-        f"Erstelle eine moderne One-Page-Website basierend auf:\n\n{req.prompt}\n\n"
+        f"Erstelle eine moderne One-Page basierend auf:\n\n{req.prompt}\n\n"
         f"{images_block}"
-        "- Nutze die vorhandenen Bilder sinnvoll (Hero, Galerie, Features, Team, Kontakt). "
-        "Semantisches HTML, responsives CSS, dunkles Theme erlaubt. "
-        "Gib ausschließlich das vollständige HTML-Dokument zurück."
+        "- Semantisches HTML, responsives CSS, dunkles Theme erlaubt.\n"
+        "- Gib ausschließlich das vollständige HTML-Dokument zurück."
     )
 
     payload = {
@@ -220,6 +224,7 @@ async def generate(req: GenReq):
     data = await call_provider(payload)
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     html = strip_fences(content)
+
     if "<html" not in html.lower():
         html = (
             "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
@@ -228,12 +233,25 @@ async def generate(req: GenReq):
             f"</head><body><h1>Entwurf</h1><pre>{content}</pre></body></html>"
         )
 
+    # 1) Pfade für gespeicherte Datei sicher RELATIV machen
     if names:
-        html = fix_img_paths(html, names)
+        html_saved = fix_img_paths_relative(html, names)
+    else:
+        html_saved = html
 
-    write_html(bid, html)
+    # 2) Für Vorschau ABSOLUT machen
+    html_preview = absolutize_for_preview(html_saved, bid)
+
+    write_html(bid, html_saved)
     usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
-    return {"bundle_id": bid, "html": html, "meta": usage, "assets": names, "applied": picked}
+    return {
+        "bundle_id": bid,
+        "html": html_saved,          # relative Pfade, passt ins ZIP
+        "html_preview": html_preview,# absolute Pfade, funktioniert live
+        "meta": usage,
+        "assets": names,
+        "applied": picked
+    }
 
 # ---------- ZIP ----------
 @app.get("/bundle/{bundle_id}.zip")
