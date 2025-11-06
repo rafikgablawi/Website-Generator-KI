@@ -21,9 +21,12 @@
     td{color:#cbd5e1}
     img.logo{width:120px;margin-bottom:10px;border-radius:12px}
   </style>
+  <link rel="icon" href="/static/logo.jpg">
 </head>
 <body>
-  <img src="logo.jpg" alt="WebPilot Logo" class="logo">
+  <!-- Logo: wird über /logo.jpg (Alias) oder /static/logo.jpg bereitgestellt -->
+  <img src="/logo.jpg" alt="Logo" class="logo" onerror="this.src='/static/logo.jpg'">
+
   <h1>🧠 Website-Generator KI</h1>
   <p style="color:#94a3b8;margin:0 0 8px">Beschreibe deine Website:</p>
   <textarea id="prompt" placeholder="z. B. Moderne Homepage für „Studio Aurora“ mit Hero, Leistungen, Prozess, Referenzen, Kontakt."></textarea>
@@ -38,7 +41,7 @@
 
   <div id="preview">💡 Hier erscheint deine generierte Website …</div>
 
-  <!-- Ergänzte Tabelle -->
+  <!-- Modelltabelle -->
   <table>
     <thead>
       <tr><th>Modell</th><th>Beschreibung</th></tr>
