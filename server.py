@@ -8,32 +8,43 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# --- Konfiguration aus Umgebungsvariablen ---
-OLLAMA_API_KEY  = os.getenv("OLLAMA_API_KEY", "").strip()
-OLLAMA_CLOUD_BASE = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
+# --- Konfiguration ---
+OLLAMA_API_KEY     = os.getenv("OLLAMA_API_KEY", "").strip()
+OLLAMA_CLOUD_BASE  = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1").rstrip("/")
+
+BASE_DIR   = Path(__file__).resolve().parent
+INDEX_FILE = BASE_DIR / "index.html"
+STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
 
 # --- FastAPI ---
 app = FastAPI(title="Website-Generator KI")
 
-# CORS: gleiche Origin reicht. Für Debug: ["*"] möglich, aber hier nicht nötig.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],      # gleiche Origin liefert HTML + API → kein CORS nötig
-    allow_credentials=True,
-    allow_methods=["POST","GET","OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_origins=["*"],  # Render + lokal problemlos
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# --- Statische Auslieferung / Root ---
-BASE_DIR = Path(__file__).resolve().parent
-INDEX_FILE = BASE_DIR / "index.html"
-app.mount("/static", StaticFiles(directory=str(BASE_DIR)), name="static")
+# Statische Dateien unter /static bereitstellen
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# --- Routen ---
 @app.get("/")
 def root():
     if INDEX_FILE.exists():
-        return FileResponse(str(INDEX_FILE))
-    return JSONResponse({"error":"index.html fehlt"}, status_code=404)
+        return FileResponse(str(INDEX_FILE), media_type="text/html; charset=utf-8")
+    return JSONResponse({"error": "index.html fehlt"}, status_code=404)
+
+# Alias, damit /logo.jpg direkt funktioniert (Render-Logs zeigten 404 darauf)
+@app.get("/logo.jpg")
+def logo_alias():
+    path = STATIC_DIR / "logo.jpg"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="logo.jpg fehlt unter static/")
+    return FileResponse(str(path), media_type="image/jpeg")
 
 @app.get("/health")
 def health():
@@ -48,7 +59,8 @@ class Req(BaseModel):
 
 # --- Helper ---
 def _strip_fences(txt: str) -> str:
-    if not txt: return txt
+    if not txt:
+        return txt
     txt = re.sub(r"^\s*```[a-zA-Z0-9]*\s*", "", txt.strip())
     txt = re.sub(r"\s*```\s*$", "", txt)
     return txt.strip()
@@ -88,8 +100,8 @@ async def generate(req: Req):
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt fehlt")
 
-    model = (req.model or "qwen3-coder:480b-cloud").strip()
-    max_tokens = int(req.max_tokens or 1000)
+    model       = (req.model or "qwen3-coder:480b-cloud").strip()
+    max_tokens  = int(req.max_tokens or 1000)
     temperature = float(req.temperature if req.temperature is not None else 0.4)
 
     system = (
@@ -105,8 +117,8 @@ async def generate(req: Req):
     payload = {
         "model": model,
         "messages": [
-            {"role":"system","content": system},
-            {"role":"user","content":   user},
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -128,8 +140,8 @@ async def generate(req: Req):
     usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
     return {"html": html, "meta": usage}
 
-# --- local/Render start ---
+# --- Start (Render setzt $PORT) ---
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", "8000"))  # Render setzt $PORT automatisch
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("server:app", host="0.0.0.0", port=port)
